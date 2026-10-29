@@ -1,0 +1,6 @@
+# Only needed to rebuild index.html / areas.geojson (server.py needs nothing beyond Python 3.8+)
+shapely>=2.0
+# tools/ only
+networkx>=3.0
+pyshp>=2.3
+matplotlib>=3.7
