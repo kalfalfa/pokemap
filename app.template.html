@@ -378,7 +378,7 @@ let C = {};
 function readColors() {
   const cs = getComputedStyle(document.documentElement);
   const v = (n) => cs.getPropertyValue(n).trim();
-  C = { line: v("--area-line"), fill: v("--area-fill"), pick: v("--pick"), pickLine: v("--pick-line"), ward: v("--ward-line"), road: v("--road"),
+  C = { line: v("--area-line"), fill: v("--area-fill"), pick: v("--pick"), pickLine: v("--pick-line"), ink: v("--ink"), ward: v("--ward-line"), road: v("--road"),
         ramp: [0,1,2,3,4,5].map((i) => v("--ramp-" + i)) };
   $("#ramp").innerHTML = C.ramp.map((c) => `<span style="background:${c}"></span>`).join("");
 }
@@ -475,6 +475,58 @@ function styleFor(id) {
     : { color: C.line, weight: hot ? 3 : 1, fillColor: C.fill, fillOpacity: hot ? 0.15 : 0.03, opacity: 0.7 };
 }
 function restyleAll() { for (const [id, layer] of layers) layer.setStyle(styleFor(id)); }
+
+/* Outer boundary around contiguous voted areas on the Overview, so the shaded
+   blob reads as one shape. Adjacent polygons' shared edges don't line up exactly
+   after per-polygon simplify, so edge-counting leaks interior lines; instead we
+   paint on a canvas: stroke every voted polygon thick, then erase inside each
+   one with destination-out. The strokes outside the group survive; the interior
+   stroke halves land inside a neighbour and get erased. */
+map.createPane("outline-mask");
+const outlineMaskPane = map.getPane("outline-mask");
+outlineMaskPane.style.zIndex = 420;
+outlineMaskPane.style.pointerEvents = "none";
+const outlineCanvas = document.createElement("canvas");
+outlineCanvas.style.cssText = "position:absolute;left:0;top:0;pointer-events:none;transition:opacity .12s";
+outlineMaskPane.appendChild(outlineCanvas);
+let votedFeats = [];
+function drawOutline() {
+  const size = map.getSize();
+  const topLeft = map.containerPointToLayerPoint([0, 0]);
+  L.DomUtil.setPosition(outlineCanvas, topLeft);
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  outlineCanvas.width = size.x * dpr;
+  outlineCanvas.height = size.y * dpr;
+  outlineCanvas.style.width = size.x + "px";
+  outlineCanvas.style.height = size.y + "px";
+  const ctx = outlineCanvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, size.x, size.y);
+  if (!votedFeats.length) return;
+  const trace = (g) => {
+    const polys = g.type === "Polygon" ? [g.coordinates] : g.coordinates;
+    for (const poly of polys) for (const ring of poly) {
+      ring.forEach((pt, i) => {
+        const p = map.latLngToContainerPoint([pt[1], pt[0]]);
+        if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+      });
+      ctx.closePath();
+    }
+  };
+  ctx.strokeStyle = C.ink; ctx.lineWidth = 4; ctx.lineJoin = "round"; ctx.lineCap = "round";
+  for (const f of votedFeats) { ctx.beginPath(); trace(f.geometry); ctx.stroke(); }
+  ctx.globalCompositeOperation = "destination-out";
+  for (const f of votedFeats) { ctx.beginPath(); trace(f.geometry); ctx.fill("evenodd"); }
+  ctx.globalCompositeOperation = "source-over";
+}
+map.on("moveend viewreset resize", drawOutline);
+map.on("zoomstart", () => { outlineCanvas.style.opacity = "0"; });
+map.on("zoomend", () => { drawOutline(); outlineCanvas.style.opacity = "1"; });
+
+function buildOverviewOutline() {
+  votedFeats = view === "overview" ? AREAS.features.filter((f) => metricValue(f.id) > 0) : [];
+  drawOutline();
+}
 
 /* ---------- PNG export ---------- */
 async function exportPNG(mode) {
@@ -584,6 +636,35 @@ async function renderPNG(mode) {
   const feats = AREAS.features.slice();
   if (mode === "pick") feats.sort((a, b) => Number(picks.has(a.id)) - Number(picks.has(b.id)));
   for (const f of feats) drawGeom(f.geometry, colorFor(f));
+  // Thick perimeter around the contiguous voted group. Drawn on an offscreen
+  // canvas so destination-out erases only strokes (not the basemap / ramp fills).
+  if (mode === "overview") {
+    const voted = AREAS.features.filter((f) => metricValue(f.id) > 0);
+    if (voted.length) {
+      const oc = document.createElement("canvas");
+      oc.width = mapW; oc.height = mapH;
+      const octx = oc.getContext("2d");
+      octx.translate(-ox, -oy);
+      const otrace = (g) => {
+        const polys = g.type === "Polygon" ? [g.coordinates] : g.coordinates;
+        for (const rings of polys) {
+          octx.beginPath();
+          for (const ring of rings) {
+            ring.forEach((pt, i) => {
+              const [x, y] = proj(pt[1], pt[0]);
+              if (i === 0) octx.moveTo(x, y); else octx.lineTo(x, y);
+            });
+            octx.closePath();
+          }
+        }
+      };
+      octx.strokeStyle = C.ink; octx.lineWidth = 4; octx.lineJoin = "round"; octx.lineCap = "round";
+      for (const f of voted) { otrace(f.geometry); octx.stroke(); }
+      octx.globalCompositeOperation = "destination-out";
+      for (const f of voted) { otrace(f.geometry); octx.fill("evenodd"); }
+      ctx.drawImage(oc, ox, oy);
+    }
+  }
   // Street / place-name labels on top of polygons.
   for (let i = 0; i < jobs.length; i++) {
     if (jobs[i].kind !== "labels" || !results[i]) continue;
@@ -803,7 +884,7 @@ function renderOverview() {
     return `<li><button data-fly="${id}"><span class="bar-wrap"><span class="n"><b>${esc(p.name)}</b></span><span class="b" style="width:${Math.max(4, (v / maxCache) * 100)}%"></span></span><span class="v">${metric === "count" ? fmt.format(v) : v.toFixed(1)}</span></button></li>`;
   }).join("");
   $("#updated").textContent = stats.updated ? `Updated ${new Date(stats.updated).toLocaleTimeString("en-CA", { hour: "numeric", minute: "2-digit" })}` : "";
-  if (view === "overview") restyleAll();
+  if (view === "overview") { restyleAll(); buildOverviewOutline(); }
 }
 $("#top").addEventListener("click", (e) => { const b = e.target.closest("[data-fly]"); if (b) flyTo(b.dataset.fly); });
 document.querySelectorAll('input[name="metric"]').forEach((r) => r.addEventListener("change", () => { metric = r.value; renderOverview(); }));
@@ -820,14 +901,14 @@ function setView(v, push) {
     loadStats(); poll = setInterval(loadStats, 20000);
     if (!seenOverview) { seenOverview = true; map.fitBounds(regionBounds(), { padding: [10, 10] }); }
   }
-  restyleAll(); markAllNums();
+  restyleAll(); markAllNums(); buildOverviewOutline();
   if (push) { try { history.replaceState(null, "", "#" + view); } catch (e) {} }
 }
 document.querySelector(".tabs").addEventListener("click", (e) => { const b = e.target.closest("[data-view]"); if (b) setView(b.dataset.view, true); });
 window.addEventListener("hashchange", () => setView(location.hash.slice(1)));
 
 /* ---------- theme changes ---------- */
-dark.addEventListener("change", () => { readColors(); setTiles(); restyleAll(); });
+dark.addEventListener("change", () => { readColors(); setTiles(); restyleAll(); buildOverviewOutline(); });
 
 /* ---------- toast ---------- */
 let toastTimer = null;
