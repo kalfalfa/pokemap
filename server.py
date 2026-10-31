@@ -47,10 +47,13 @@ AREA_GROUP = {f["id"]: f["properties"].get("group", "") for f in json.loads((HER
 AREA_IDS = set(AREA_GROUP)
 
 # ---------------- storage ----------------
-db_lock = threading.Lock()
-db = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)
-db.execute("PRAGMA journal_mode=WAL")
-db.executescript("""
+# Per-thread sqlite connections, no Python-side lock. SQLite WAL allows many
+# readers and one writer; busy_timeout lets writers wait their turn in the C
+# layer. Writers use BEGIN IMMEDIATE so they take the write lock up front
+# instead of upgrading mid-transaction (which can deadlock).
+_init = sqlite3.connect(DB_PATH, isolation_level=None)
+_init.execute("PRAGMA journal_mode=WAL")
+_init.executescript("""
 CREATE TABLE IF NOT EXISTS users (
   uid TEXT PRIMARY KEY, ip_hash TEXT, created REAL, updated REAL);
 CREATE TABLE IF NOT EXISTS picks (
@@ -60,15 +63,31 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 """)
 for col in ("username TEXT", "pin_hash TEXT"):
     try:
-        db.execute(f"ALTER TABLE users ADD COLUMN {col}")
+        _init.execute(f"ALTER TABLE users ADD COLUMN {col}")
     except sqlite3.OperationalError:
         pass
-db.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_username ON users(username) WHERE username IS NOT NULL")
-row = db.execute("SELECT v FROM meta WHERE k='salt'").fetchone()
+_init.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_username ON users(username) WHERE username IS NOT NULL")
+row = _init.execute("SELECT v FROM meta WHERE k='salt'").fetchone()
 SALT = os.environ.get("SALT") or (row[0] if row else None)
 if not SALT:
     SALT = secrets.token_hex(16)
-    db.execute("INSERT INTO meta VALUES ('salt', ?)", (SALT,))
+    _init.execute("INSERT INTO meta VALUES ('salt', ?)", (SALT,))
+_init.close()
+
+_tls = threading.local()
+def db():
+    conn = getattr(_tls, "conn", None)
+    if conn is None:
+        conn = sqlite3.connect(DB_PATH, isolation_level=None)
+        conn.execute("PRAGMA busy_timeout = 5000")
+        _tls.conn = conn
+    return conn
+
+def rollback_quiet(conn):
+    try:
+        conn.execute("ROLLBACK")
+    except sqlite3.OperationalError:
+        pass
 
 def ip_hash(ip):
     return hashlib.sha256((SALT + ip).encode()).hexdigest()[:16]
@@ -83,12 +102,12 @@ def stats_body():
     now = time.time()
     if now - _stats["at"] < 5 and _stats["body"]:
         return _stats["body"]
-    with db_lock:
-        per_user = {}
-        for uid, area in db.execute("SELECT uid, area FROM picks"):
-            per_user.setdefault(uid, []).append(area)
-        nets = db.execute(
-            "SELECT COUNT(DISTINCT ip_hash) FROM users WHERE uid IN (SELECT DISTINCT uid FROM picks)").fetchone()[0]
+    conn = db()
+    per_user = {}
+    for uid, area in conn.execute("SELECT uid, area FROM picks"):
+        per_user.setdefault(uid, []).append(area)
+    nets = conn.execute(
+        "SELECT COUNT(DISTINCT ip_hash) FROM users WHERE uid IN (SELECT DISTINCT uid FROM picks)").fetchone()[0]
     counts, shares, groups = {}, {}, {}
     for areas in per_user.values():
         for g in {AREA_GROUP.get(a, "") for a in areas} - {""}:
@@ -173,9 +192,9 @@ class Handler(BaseHTTPRequestHandler):
             uid = (parse_qs(u.query).get("uid") or [""])[0].lower()
             if not UID_RE.match(uid):
                 return self.json(400, {"error": "bad uid"})
-            with db_lock:
-                row = db.execute("SELECT username FROM users WHERE uid=?", (uid,)).fetchone()
-                areas = [r[0] for r in db.execute("SELECT area FROM picks WHERE uid=?", (uid,))]
+            conn = db()
+            row = conn.execute("SELECT username FROM users WHERE uid=?", (uid,)).fetchone()
+            areas = [r[0] for r in conn.execute("SELECT area FROM picks WHERE uid=?", (uid,))]
             return self.json(200, {"known": row is not None, "username": (row[0] if row else None), "areas": areas})
         if u.path == "/api/stats":
             return self.send(200, stats_body())
@@ -186,12 +205,11 @@ class Handler(BaseHTTPRequestHandler):
             buf = io.StringIO()
             w = csv.writer(buf)
             w.writerow(["user", "network", "area", "user_first_seen", "user_last_change"])
-            with db_lock:
-                for r in db.execute("""SELECT substr(u.uid,1,8), u.ip_hash, p.area, u.created, u.updated
-                                       FROM picks p JOIN users u USING(uid) ORDER BY u.created"""):
-                    w.writerow([r[0], r[1], r[2],
-                                datetime.fromtimestamp(r[3], timezone.utc).isoformat(timespec="seconds"),
-                                datetime.fromtimestamp(r[4], timezone.utc).isoformat(timespec="seconds")])
+            for r in db().execute("""SELECT substr(u.uid,1,8), u.ip_hash, p.area, u.created, u.updated
+                                     FROM picks p JOIN users u USING(uid) ORDER BY u.created"""):
+                w.writerow([r[0], r[1], r[2],
+                            datetime.fromtimestamp(r[3], timezone.utc).isoformat(timespec="seconds"),
+                            datetime.fromtimestamp(r[4], timezone.utc).isoformat(timespec="seconds")])
             return self.send(200, buf.getvalue().encode(), "text/csv; charset=utf-8",
                              {"Content-Disposition": 'attachment; filename="scanzones-picks.csv"'})
         if u.path == "/healthz":
@@ -220,17 +238,25 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(429, {"error": "slow down"})
             h = pin_hash(username, pin)
             now = time.time()
-            with db_lock:
-                existing = db.execute("SELECT uid FROM users WHERE username=?", (username,)).fetchone()
+            conn = db()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = conn.execute("SELECT uid FROM users WHERE username=?", (username,)).fetchone()
                 if existing and existing[0] != uid:
+                    conn.execute("ROLLBACK")
                     return self.json(409, {"error": "username taken"})
-                db.execute("BEGIN")
-                db.execute("""INSERT INTO users(uid, ip_hash, created, updated, username, pin_hash)
-                              VALUES (?,?,?,?,?,?)
-                              ON CONFLICT(uid) DO UPDATE SET updated=excluded.updated,
-                                  username=excluded.username, pin_hash=excluded.pin_hash""",
-                           (uid, ip_hash(self.client_ip()), now, now, username, h))
-                db.execute("COMMIT")
+                conn.execute("""INSERT INTO users(uid, ip_hash, created, updated, username, pin_hash)
+                                VALUES (?,?,?,?,?,?)
+                                ON CONFLICT(uid) DO UPDATE SET updated=excluded.updated,
+                                    username=excluded.username, pin_hash=excluded.pin_hash""",
+                             (uid, ip_hash(self.client_ip()), now, now, username, h))
+                conn.execute("COMMIT")
+            except sqlite3.IntegrityError:
+                rollback_quiet(conn)
+                return self.json(409, {"error": "username taken"})
+            except Exception:
+                rollback_quiet(conn)
+                raise
             return self.json(200, {"ok": True, "username": username})
         if p == "/api/resume":
             if not allow(self.client_ip()):
@@ -241,12 +267,12 @@ class Handler(BaseHTTPRequestHandler):
             if not USERNAME_RE.match(username) or not PIN_RE.match(pin):
                 return self.json(400, {"error": "bad request"})
             h = pin_hash(username, pin)
-            with db_lock:
-                row = db.execute("SELECT uid, pin_hash FROM users WHERE username=?", (username,)).fetchone()
-                ok = row and row[1] and secrets.compare_digest(row[1], h)
-                if not ok:
-                    return self.json(403, {"error": "wrong username or PIN"})
-                areas = [r[0] for r in db.execute("SELECT area FROM picks WHERE uid=?", (row[0],))]
+            conn = db()
+            row = conn.execute("SELECT uid, pin_hash FROM users WHERE username=?", (username,)).fetchone()
+            ok = row and row[1] and secrets.compare_digest(row[1], h)
+            if not ok:
+                return self.json(403, {"error": "wrong username or PIN"})
+            areas = [r[0] for r in conn.execute("SELECT area FROM picks WHERE uid=?", (row[0],))]
             return self.json(200, {"uid": row[0], "username": username, "areas": areas})
         return self.json(404, {"error": "not found"})
 
@@ -268,14 +294,18 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return self.json(400, {"error": "bad request"})
         now = time.time()
-        with db_lock:
-            db.execute("BEGIN")
-            db.execute("""INSERT INTO users(uid, ip_hash, created, updated) VALUES (?,?,?,?)
-                          ON CONFLICT(uid) DO UPDATE SET ip_hash=excluded.ip_hash, updated=excluded.updated""",
-                       (uid, ip_hash(ip), now, now))
-            db.execute("DELETE FROM picks WHERE uid=?", (uid,))
-            db.executemany("INSERT INTO picks(uid, area) VALUES (?,?)", [(uid, a) for a in areas])
-            db.execute("COMMIT")
+        conn = db()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("""INSERT INTO users(uid, ip_hash, created, updated) VALUES (?,?,?,?)
+                            ON CONFLICT(uid) DO UPDATE SET ip_hash=excluded.ip_hash, updated=excluded.updated""",
+                         (uid, ip_hash(ip), now, now))
+            conn.execute("DELETE FROM picks WHERE uid=?", (uid,))
+            conn.executemany("INSERT INTO picks(uid, area) VALUES (?,?)", [(uid, a) for a in areas])
+            conn.execute("COMMIT")
+        except Exception:
+            rollback_quiet(conn)
+            raise
         _stats["at"] = 0
         self.json(200, {"ok": True, "areas": areas})
 

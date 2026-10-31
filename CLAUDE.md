@@ -30,7 +30,7 @@ server.py (stdlib only) ── serves index.html, /api/me (GET/PUT), /api/stats,
 - **Basemap**: CARTO raster tiles, Voyager (light) / Dark Matter (dark), loaded as a no-labels base layer plus a labels-only layer in a pane above the area polygons so street names stay readable. URLs are `https://basemaps.cartocdn.com/rastertiles/{voyager|dark}_{nolabels|only_labels}/{z}/{x}/{y}{r}.png?key=KEY`. CARTO now requires a key; without it tiles show an "API key required" watermark.
 - **Fallback roads**: if no tile ever loads, the page draws major roads from embedded City data so the map isn't blank.
 - **Labels**: area names appear only at zoom ≥ 13 (`zoomed-in` class); Airdrie and CrossIron labels always show. Selected areas turn gold.
-- **Backend** (`server.py`): tables `users(uid, ip_hash, created, updated)`, `picks(uid, area)`, `meta(salt)`. A PUT replaces a user's whole pick list. Stats cached 5 s. Rate limit 40 writes/min/IP. IPs stored only as salted SHA-256 prefixes. Unique "networks" = distinct ip_hash among voters.
+- **Backend** (`server.py`): tables `users(uid, ip_hash, created, updated, username, pin_hash)`, `picks(uid, area)`, `meta(salt)`. A PUT replaces a user's whole pick list. Stats cached 5 s. Rate limit 40 writes/min/IP. IPs stored only as salted SHA-256 prefixes. Unique "networks" = distinct ip_hash among voters. Concurrency: `ThreadingHTTPServer` with per-thread sqlite connections cached in `threading.local()`, WAL journal mode, `PRAGMA busy_timeout=5000`, and `BEGIN IMMEDIATE` for writes — no Python-side lock. (An earlier version used a single shared connection behind a global `threading.Lock`, which could wedge the whole app if one handler got stuck holding it while `/healthz` kept returning 200.)
 
 ## Current area design
 
